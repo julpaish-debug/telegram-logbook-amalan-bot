@@ -368,9 +368,7 @@ async def start_log(chat_id: int, user_id: str) -> None:
     DRAFTS[user_id] = DraftState(date=today_str(), answers=empty_answers())
     await telegram_app.bot.send_message(
         chat_id=chat_id,
-        text="📒 Pilih tanggal logbook:
-- Hari ini
-- Tanggal lain",
+        text="📒 Pilih tanggal logbook:\n- Hari ini\n- Tanggal lain",
         reply_markup=build_date_choice_keyboard(),
     )
 
