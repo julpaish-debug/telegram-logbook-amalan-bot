@@ -340,21 +340,13 @@ app = fastapi_app
 async def send_start(chat_id: int) -> None:
     assert telegram_app is not None
     text = (
-        "Assalamu’alaikum. Bot logbook amalan harian siap digunakan.
-
-"
-        "Perintah:
-"
-        "- /start untuk menu awal
-"
-        "- /help untuk bantuan
-"
-        "- /log untuk isi atau revisi log
-"
-        "- /today untuk lihat log hari ini
-"
-        "- /rekap untuk lihat 7 hari terakhir
-"
+        "Assalamu’alaikum. Bot logbook amalan harian siap digunakan.\n\n"
+        "Perintah:\n"
+        "- /start untuk menu awal\n"
+        "- /help untuk bantuan\n"
+        "- /log untuk isi atau revisi log\n"
+        "- /today untuk lihat log hari ini\n"
+        "- /rekap untuk lihat 7 hari terakhir\n"
         "- /cancel untuk batalkan draft saat ini"
     )
     await telegram_app.bot.send_message(chat_id=chat_id, text=text)
