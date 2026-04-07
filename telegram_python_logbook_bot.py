@@ -9,6 +9,7 @@ Stack:
 
 Features (MVP):
 - /start
+- /help
 - /log
 - /today
 - /rekap
@@ -17,25 +18,21 @@ Features (MVP):
 - Notes harian
 - Preview before save
 - Upsert daily record into Google Sheets
+- Pilih tanggal saat log
+- Overwrite otomatis jika tanggal yang sama sudah ada
 
 Required environment variables:
 - BOT_TOKEN
-- WEBHOOK_SECRET           # random secret string for webhook path
-- APP_BASE_URL             # e.g. https://your-app.onrender.com
-- GOOGLE_SHEETS_ID         # spreadsheet ID
-- GOOGLE_SERVICE_ACCOUNT_JSON  # full JSON string for service account credentials
-- TZ                       # optional, default Asia/Jakarta
+- WEBHOOK_SECRET
+- APP_BASE_URL
+- GOOGLE_SHEETS_ID
+- GOOGLE_SERVICE_ACCOUNT_JSON
+- TZ (optional, default Asia/Jakarta)
 
 Endpoints:
 - GET  /health
 - POST /webhook/{WEBHOOK_SECRET}
-- POST /setup-webhook      # optional helper endpoint
-
-Install:
-pip install fastapi uvicorn python-telegram-bot gspread google-auth
-
-Run locally:
-uvicorn telegram_python_logbook_bot:app --host 0.0.0.0 --port 8000
+- POST /setup-webhook
 """
 
 from __future__ import annotations
@@ -51,7 +48,7 @@ from zoneinfo import ZoneInfo
 import gspread
 from fastapi import FastAPI, Header, HTTPException, Request
 from google.oauth2.service_account import Credentials
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application
 
@@ -159,8 +156,6 @@ class DraftState:
     answers: Dict[str, str] = field(default_factory=dict)
 
 
-# In-memory session storage for personal use MVP.
-# If you want persistence across restarts, move this to Redis / database.
 DRAFTS: Dict[str, DraftState] = {}
 
 
@@ -214,6 +209,15 @@ def build_preview_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def build_date_choice_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("Hari ini", callback_data="date|today"),
+            InlineKeyboardButton("Tanggal lain", callback_data="date|other"),
+        ]]
+    )
+
+
 def format_log_text(date: str, answers: Dict[str, str], notes: str, preview: bool = False) -> str:
     lines: List[str] = []
     title = "📌 Preview Logbook" if preview else "📒 Logbook Amalan"
@@ -262,14 +266,13 @@ class SheetsRepository:
         if not first_row:
             ws.append_row(HEADERS)
         elif first_row != HEADERS:
-            # Keep current sheet but ensure headers exist in row 1.
             ws.update("A1:T1", [HEADERS])
         return ws
 
     def _all_records(self) -> List[Dict[str, str]]:
         return self.worksheet.get_all_records(expected_headers=HEADERS)
 
-    def get_today_log(self, user_id: str, date_str: str) -> Optional[Dict[str, str]]:
+    def get_log_by_date(self, user_id: str, date_str: str) -> Optional[Dict[str, str]]:
         for record in self._all_records():
             if str(record.get("User ID")) == str(user_id) and record.get("Date") == date_str:
                 return record
@@ -346,21 +349,10 @@ async def send_start(chat_id: int) -> None:
         "- /help untuk bantuan\n"
         "- /log untuk isi atau revisi log\n"
         "- /today untuk lihat log hari ini\n"
-        "- /rekap untuk lihat 7 hari terakhir\n"
+        "- /rekap untuk lihat rekap 7 hari terakhir\n"
         "- /cancel untuk batalkan draft saat ini"
     )
     await telegram_app.bot.send_message(chat_id=chat_id, text=text)
-
-
-def build_date_choice_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("Hari ini", callback_data="date|today"),
-                InlineKeyboardButton("Tanggal lain", callback_data="date|other"),
-            ]
-        ]
-    )
 
 
 async def start_log(chat_id: int, user_id: str) -> None:
@@ -429,7 +421,7 @@ async def send_preview(chat_id: int, user_id: str) -> None:
 async def send_log_by_date(chat_id: int, user_id: str, date_str: str) -> None:
     assert telegram_app is not None
     assert repo is not None
-    row = repo.get_today_log(user_id, date_str)
+    row = repo.get_log_by_date(user_id, date_str)
     if not row:
         await telegram_app.bot.send_message(chat_id=chat_id, text=f"Belum ada log untuk tanggal {date_str}.")
         return
@@ -466,8 +458,12 @@ async def send_recap(chat_id: int, user_id: str, days: int = 7) -> None:
         lines.append(f"✅ <b>Dilakukan:</b> {done_text}")
         lines.append(f"📝 <b>Notes:</b> {notes}")
         lines.append("")
-    await telegram_app.bot.send_message(chat_id=chat_id, text="
-".join(lines), parse_mode=ParseMode.HTML)
+
+    await telegram_app.bot.send_message(
+        chat_id=chat_id,
+        text="\n".join(lines),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def save_final(chat_id: int, user_id: str) -> None:
@@ -478,13 +474,15 @@ async def save_final(chat_id: int, user_id: str) -> None:
         await telegram_app.bot.send_message(chat_id=chat_id, text="Draft tidak ditemukan. Mulai lagi dengan /log")
         return
 
-    existing = repo.get_today_log(user_id, draft.date)
+    existing = repo.get_log_by_date(user_id, draft.date)
     repo.upsert_daily_log(user_id, draft)
     DRAFTS.pop(user_id, None)
+
     if existing:
         await telegram_app.bot.send_message(chat_id=chat_id, text=f"✅ Logbook tanggal {draft.date} berhasil direvisi.")
     else:
         await telegram_app.bot.send_message(chat_id=chat_id, text=f"✅ Logbook tanggal {draft.date} berhasil disimpan.")
+
     await send_log_by_date(chat_id, user_id, draft.date)
 
 
@@ -506,6 +504,7 @@ async def handle_text_message(update: Update) -> None:
                 text="Format tanggal salah. Gunakan format YYYY-MM-DD, contoh: 2026-04-08",
             )
             return
+
         draft.date = parsed_date
         draft.waiting_date_input = False
         draft.current_index = 0
@@ -525,18 +524,12 @@ async def handle_text_message(update: Update) -> None:
         await telegram_app.bot.send_message(
             chat_id=chat_id,
             text=(
-                "Perintah yang tersedia:
-"
-                "/start - buka menu awal
-"
-                "/help - bantuan command
-"
-                "/log - isi atau revisi logbook
-"
-                "/today - lihat log hari ini
-"
-                "/rekap - lihat rekap 7 hari terakhir
-"
+                "Perintah yang tersedia:\n"
+                "/start - buka menu awal\n"
+                "/help - bantuan command\n"
+                "/log - isi atau revisi logbook\n"
+                "/today - lihat log hari ini\n"
+                "/rekap - lihat rekap 7 hari terakhir\n"
                 "/cancel - batalkan draft saat ini"
             ),
         )
@@ -660,12 +653,12 @@ async def startup_event() -> None:
     await telegram_app.initialize()
     repo = SheetsRepository()
     await telegram_app.bot.set_my_commands([
-        ("start", "Menu awal"),
-        ("help", "Bantuan command"),
-        ("log", "Isi atau revisi logbook"),
-        ("today", "Lihat log hari ini"),
-        ("rekap", "Lihat rekap 7 hari terakhir"),
-        ("cancel", "Batalkan draft aktif"),
+        BotCommand("start", "Menu awal"),
+        BotCommand("help", "Bantuan command"),
+        BotCommand("log", "Isi atau revisi logbook"),
+        BotCommand("today", "Lihat log hari ini"),
+        BotCommand("rekap", "Lihat rekap 7 hari terakhir"),
+        BotCommand("cancel", "Batalkan draft aktif"),
     ])
     logger.info("Application initialized")
 
@@ -683,12 +676,16 @@ async def health() -> Dict[str, str]:
 
 
 @fastapi_app.post("/webhook/{secret}")
-async def webhook(secret: str, request: Request, x_telegram_bot_api_secret_token: Optional[str] = Header(default=None)) -> Dict[str, bool]:
+async def webhook(
+    secret: str,
+    request: Request,
+    x_telegram_bot_api_secret_token: Optional[str] = Header(default=None),
+) -> Dict[str, bool]:
     if secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="Invalid webhook secret")
 
-    # Optional extra verification if you later set secret_token in Telegram setWebhook.
     _ = x_telegram_bot_api_secret_token
+    assert telegram_app is not None
 
     data = await request.json()
     update = Update.de_json(data, telegram_app.bot)
@@ -706,6 +703,7 @@ async def setup_webhook() -> Dict[str, str]:
     assert telegram_app is not None
     if not APP_BASE_URL:
         raise HTTPException(status_code=400, detail="APP_BASE_URL is required")
+
     webhook_url = f"{APP_BASE_URL.rstrip('/')}/webhook/{WEBHOOK_SECRET}"
     await telegram_app.bot.set_webhook(url=webhook_url, drop_pending_updates=False)
     return {"status": "ok", "webhook_url": webhook_url}
