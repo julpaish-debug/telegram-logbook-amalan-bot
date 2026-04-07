@@ -154,6 +154,7 @@ class DraftState:
     date: str
     current_index: int = 0
     waiting_notes: bool = False
+    waiting_date_input: bool = False
     notes_harian: str = ""
     answers: Dict[str, str] = field(default_factory=dict)
 
@@ -339,21 +340,47 @@ app = fastapi_app
 async def send_start(chat_id: int) -> None:
     assert telegram_app is not None
     text = (
-        "Assalamu’alaikum. Bot logbook amalan harian siap digunakan.\n\n"
-        "Perintah:\n"
-        "- /log untuk isi log hari ini\n"
-        "- /today untuk lihat log hari ini\n"
-        "- /rekap untuk lihat 7 hari terakhir\n"
+        "Assalamu’alaikum. Bot logbook amalan harian siap digunakan.
+
+"
+        "Perintah:
+"
+        "- /start untuk menu awal
+"
+        "- /help untuk bantuan
+"
+        "- /log untuk isi atau revisi log
+"
+        "- /today untuk lihat log hari ini
+"
+        "- /rekap untuk lihat 7 hari terakhir
+"
         "- /cancel untuk batalkan draft saat ini"
     )
     await telegram_app.bot.send_message(chat_id=chat_id, text=text)
 
 
+def build_date_choice_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Hari ini", callback_data="date|today"),
+                InlineKeyboardButton("Tanggal lain", callback_data="date|other"),
+            ]
+        ]
+    )
+
+
 async def start_log(chat_id: int, user_id: str) -> None:
     assert telegram_app is not None
     DRAFTS[user_id] = DraftState(date=today_str(), answers=empty_answers())
-    await telegram_app.bot.send_message(chat_id=chat_id, text="📒 Memulai logbook amalan hari ini.")
-    await send_next_item(chat_id, user_id)
+    await telegram_app.bot.send_message(
+        chat_id=chat_id,
+        text="📒 Pilih tanggal logbook:
+- Hari ini
+- Tanggal lain",
+        reply_markup=build_date_choice_keyboard(),
+    )
 
 
 async def send_next_item(chat_id: int, user_id: str) -> None:
@@ -409,18 +436,22 @@ async def send_preview(chat_id: int, user_id: str) -> None:
     )
 
 
-async def send_today(chat_id: int, user_id: str) -> None:
+async def send_log_by_date(chat_id: int, user_id: str, date_str: str) -> None:
     assert telegram_app is not None
     assert repo is not None
-    row = repo.get_today_log(user_id, today_str())
+    row = repo.get_today_log(user_id, date_str)
     if not row:
-        await telegram_app.bot.send_message(chat_id=chat_id, text="Belum ada log untuk hari ini. Gunakan /log untuk mulai isi.")
+        await telegram_app.bot.send_message(chat_id=chat_id, text=f"Belum ada log untuk tanggal {date_str}.")
         return
 
     answers = {key: row.get(header, NO) for key, header in KEY_TO_HEADER.items()}
     notes = row.get("Notes Harian", "")
     text = format_log_text(row["Date"], answers, notes, preview=False)
     await telegram_app.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+
+
+async def send_today(chat_id: int, user_id: str) -> None:
+    await send_log_by_date(chat_id, user_id, today_str())
 
 
 async def send_recap(chat_id: int, user_id: str, days: int = 7) -> None:
@@ -431,11 +462,22 @@ async def send_recap(chat_id: int, user_id: str, days: int = 7) -> None:
         await telegram_app.bot.send_message(chat_id=chat_id, text="Belum ada data rekap.")
         return
 
-    lines = [f"📊 Rekap {days} hari terakhir"]
+    lines = [f"📊 <b>Rekap {days} hari terakhir</b>", ""]
     for row in rows:
-        yes_count = sum(1 for key, header in KEY_TO_HEADER.items() if row.get(header) == YES)
-        lines.append(f"- {row.get('Date')}: {yes_count}/{len(ALL_ITEMS)}")
-    await telegram_app.bot.send_message(chat_id=chat_id, text="\n".join(lines))
+        done_items = [
+            item["label"]
+            for item in ALL_ITEMS
+            if row.get(KEY_TO_HEADER[item["key"]]) == YES
+        ]
+        yes_count = len(done_items)
+        done_text = ", ".join(done_items) if done_items else "—"
+        notes = row.get("Notes Harian", "").strip() or "—"
+        lines.append(f"🗓️ <b>{row.get('Date')}</b>: <b>{yes_count}/{len(ALL_ITEMS)}</b>")
+        lines.append(f"✅ <b>Dilakukan:</b> {done_text}")
+        lines.append(f"📝 <b>Notes:</b> {notes}")
+        lines.append("")
+    await telegram_app.bot.send_message(chat_id=chat_id, text="
+".join(lines), parse_mode=ParseMode.HTML)
 
 
 async def save_final(chat_id: int, user_id: str) -> None:
@@ -446,10 +488,14 @@ async def save_final(chat_id: int, user_id: str) -> None:
         await telegram_app.bot.send_message(chat_id=chat_id, text="Draft tidak ditemukan. Mulai lagi dengan /log")
         return
 
+    existing = repo.get_today_log(user_id, draft.date)
     repo.upsert_daily_log(user_id, draft)
     DRAFTS.pop(user_id, None)
-    await telegram_app.bot.send_message(chat_id=chat_id, text="✅ Logbook berhasil disimpan.")
-    await send_today(chat_id, user_id)
+    if existing:
+        await telegram_app.bot.send_message(chat_id=chat_id, text=f"✅ Logbook tanggal {draft.date} berhasil direvisi.")
+    else:
+        await telegram_app.bot.send_message(chat_id=chat_id, text=f"✅ Logbook tanggal {draft.date} berhasil disimpan.")
+    await send_log_by_date(chat_id, user_id, draft.date)
 
 
 async def handle_text_message(update: Update) -> None:
@@ -461,6 +507,22 @@ async def handle_text_message(update: Update) -> None:
     chat_id = update.message.chat.id
     draft = DRAFTS.get(user_id)
 
+    if draft and draft.waiting_date_input and text and not text.startswith("/"):
+        try:
+            parsed_date = datetime.strptime(text, "%Y-%m-%d").strftime("%Y-%m-%d")
+        except ValueError:
+            await telegram_app.bot.send_message(
+                chat_id=chat_id,
+                text="Format tanggal salah. Gunakan format YYYY-MM-DD, contoh: 2026-04-08",
+            )
+            return
+        draft.date = parsed_date
+        draft.waiting_date_input = False
+        draft.current_index = 0
+        await telegram_app.bot.send_message(chat_id=chat_id, text=f"Tanggal logbook: {parsed_date}")
+        await send_next_item(chat_id, user_id)
+        return
+
     if draft and draft.waiting_notes and text and not text.startswith("/"):
         draft.notes_harian = text
         draft.waiting_notes = False
@@ -469,6 +531,25 @@ async def handle_text_message(update: Update) -> None:
 
     if text == "/start":
         await send_start(chat_id)
+    elif text == "/help":
+        await telegram_app.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "Perintah yang tersedia:
+"
+                "/start - buka menu awal
+"
+                "/help - bantuan command
+"
+                "/log - isi atau revisi logbook
+"
+                "/today - lihat log hari ini
+"
+                "/rekap - lihat rekap 7 hari terakhir
+"
+                "/cancel - batalkan draft saat ini"
+            ),
+        )
     elif text == "/log":
         await start_log(chat_id, user_id)
     elif text == "/today":
@@ -497,6 +578,29 @@ async def handle_callback_query(update: Update) -> None:
     data = query.data or ""
     parts = data.split("|")
     action = parts[0]
+
+    if action == "date":
+        mode = parts[1]
+        draft = DRAFTS.get(user_id)
+        if not draft:
+            await telegram_app.bot.send_message(chat_id=chat_id, text="Draft tidak ditemukan. Mulai lagi dengan /log")
+            return
+
+        if mode == "today":
+            draft.date = today_str()
+            draft.waiting_date_input = False
+            draft.current_index = 0
+            await telegram_app.bot.send_message(chat_id=chat_id, text=f"Tanggal logbook: {draft.date}")
+            await send_next_item(chat_id, user_id)
+            return
+
+        if mode == "other":
+            draft.waiting_date_input = True
+            await telegram_app.bot.send_message(
+                chat_id=chat_id,
+                text="Kirim tanggal logbook dengan format YYYY-MM-DD, contoh: 2026-04-08",
+            )
+            return
 
     if action == "lg":
         item_key = parts[1]
@@ -565,6 +669,14 @@ async def startup_event() -> None:
     telegram_app = Application.builder().token(BOT_TOKEN).updater(None).build()
     await telegram_app.initialize()
     repo = SheetsRepository()
+    await telegram_app.bot.set_my_commands([
+        ("start", "Menu awal"),
+        ("help", "Bantuan command"),
+        ("log", "Isi atau revisi logbook"),
+        ("today", "Lihat log hari ini"),
+        ("rekap", "Lihat rekap 7 hari terakhir"),
+        ("cancel", "Batalkan draft aktif"),
+    ])
     logger.info("Application initialized")
 
 
